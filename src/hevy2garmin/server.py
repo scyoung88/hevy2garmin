@@ -1530,7 +1530,7 @@ async def _do_sync_one(request: Request):
     page = 1
     max_pages = (remaining // 10) + 2  # Don't search forever
     while page <= max_pages:
-        data = hevy.get_workouts(page=page, page_size=10)
+        data = hevy.get_workouts(page=page, page_size=100)
         workouts = data.get("workouts", [])
         if not workouts:
             break
