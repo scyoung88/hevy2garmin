@@ -666,7 +666,17 @@ def _ensure_custom_loaded() -> None:
 
 
 def save_custom_mapping(hevy_name: str, category: int, subcategory: int) -> None:
-    """Save a custom exercise mapping to disk."""
+    """Save a custom exercise mapping to DB (cloud) or disk (local)."""
+    from hevy2garmin.db import get_database_url, get_db
+
+    # Cloud deployments: persist to the database
+    if get_database_url():
+        _db = get_db()
+        _db.save_custom_mapping(hevy_name, category, subcategory)
+        _custom_mappings[hevy_name] = (category, subcategory)
+        return
+
+    # Local/Docker: persist to disk
     import json
     from pathlib import Path
     path = Path("~/.hevy2garmin/custom_mappings.json").expanduser()
