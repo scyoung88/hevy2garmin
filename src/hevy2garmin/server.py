@@ -1528,9 +1528,9 @@ async def _do_sync_one(request: Request):
     unsynced = None
     unmapped_found: dict[str, int] = {}
     page = 1
-    max_pages = (remaining // 10) + 2  # Don't search forever
+    max_pages = (total_count // 10) + 2  # cover the whole library so backfill reaches old unsynced workouts
     while page <= max_pages:
-        max_pages = (total_count // 10) + 2  # cover the whole library so backfill reaches old unsynced workouts
+        data = hevy.get_workouts(page=page, page_size=10)
         workouts = data.get("workouts", [])
         if not workouts:
             break
@@ -1553,6 +1553,7 @@ async def _do_sync_one(request: Request):
         if page >= data.get("page_count", page):
             break
         page += 1
+        
     # Update unmapped cache in DB
     if unmapped_found:
         _db.set_app_config("unmapped_exercises", unmapped_found)
