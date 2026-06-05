@@ -50,9 +50,9 @@ def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None =
     Args:
         client: Authenticated Garmin client.
         fit_path: Path to the .fit file.
-        workout_start: ISO-8601 start time for matching the uploaded activity.
+        workout_start: ISO-8601 start time (currently ignored for matching).
 
-    Returns dict with upload_id and activity_id (if found).
+    Returns dict with upload_id and activity_id.
     """
     fit_path = Path(fit_path)
     if not fit_path.exists():
@@ -91,9 +91,16 @@ def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None =
     else:
         logger.info("  Upload response: %s", str(resp)[:200])
 
-    # Find the activity ID for renaming (with detailed logging)
-    if not activity_id and workout_start:
-        activity_id = find_activity_by_start_time(client, workout_start)
+    # === TEMPORARY FIX ===
+    # Use the activity_id returned directly from the upload response
+    # (skipping the time-based search that is failing due to old workout dates)
+    if activity_id:
+        logger.info("  Using activity_id from upload response: %s", activity_id)
+    else:
+        logger.warning("  No activity_id returned from upload response")
+        # Optional fallback (disabled for now)
+        # if workout_start:
+        #     activity_id = find_activity_by_start_time(client, workout_start)
 
     if activity_id:
         logger.info("  Found activity %s", activity_id)
@@ -140,12 +147,10 @@ def find_activity_by_start_time(
         logger.info("   [%d] Activity ID=%s | Type=%s | Name='%s' | Start=%s",
                     i, act_id, act_type, act_name, start_gmt)
 
-        # Only check strength activities
         if act_type and act_type not in ("strength_training", "other"):
             logger.debug("      → Skipped (wrong type)")
             continue
 
-        # Parse and compare time
         try:
             if "T" not in start_gmt:
                 start_gmt = start_gmt.replace(" ", "T")
@@ -206,14 +211,7 @@ def find_matching_garmin_activity(
     overlap_threshold: float = 0.70,
     max_drift_minutes: int = 20,
 ) -> dict | None:
-    """Find a user-recorded Garmin Strength Training activity matching a Hevy workout.
-
-    Searches for activities that overlap the Hevy workout's time window,
-    then scores by temporal overlap and start-time proximity.
-
-    Returns the best-matching activity dict, or None if nothing qualifies.
-    Only matches completed activities of type 'strength_training'.
-    """
+    """Find a user-recorded Garmin Strength Training activity matching a Hevy workout."""
     from datetime import datetime, timedelta, timezone
 
     start_raw = hevy_workout.get("start_time") or hevy_workout.get("startTime", "")
@@ -231,7 +229,6 @@ def find_matching_garmin_activity(
     if hevy_duration <= 0:
         return None
 
-    # Query activities in a window around the workout
     search_start = (hevy_start - timedelta(hours=2)).date().isoformat()
     search_end = (hevy_end + timedelta(hours=2)).date().isoformat()
     try:
@@ -244,17 +241,14 @@ def find_matching_garmin_activity(
     best: dict | None = None
 
     for act in (activities or []):
-        # Hard filter: strength_training only
         act_type = act.get("activityType", {}).get("typeKey", "")
         if act_type != "strength_training":
             continue
 
-        # Must be a completed activity (has duration)
         act_duration = act.get("duration", 0)
         if not act_duration or act_duration <= 0:
             continue
 
-        # Parse start time
         act_start_str = act.get("startTimeGMT") or act.get("startTimeLocal", "")
         try:
             if "T" not in act_start_str:
@@ -267,11 +261,9 @@ def find_matching_garmin_activity(
 
         act_end = act_start + timedelta(seconds=act_duration)
 
-        # Check: activity must be finished.
         if act_end > datetime.now(timezone.utc) + timedelta(minutes=5):
             continue
 
-        # Compute temporal overlap
         overlap_start = max(hevy_start.replace(tzinfo=timezone.utc), act_start.replace(tzinfo=timezone.utc))
         overlap_end = min(hevy_end.replace(tzinfo=timezone.utc), act_end.replace(tzinfo=timezone.utc))
         overlap_s = max(0.0, (overlap_end - overlap_start).total_seconds())
@@ -280,13 +272,11 @@ def find_matching_garmin_activity(
         if overlap_pct < overlap_threshold:
             continue
 
-        # Check start drift
         drift_s = abs((act_start.replace(tzinfo=timezone.utc) - hevy_start.replace(tzinfo=timezone.utc)).total_seconds())
         drift_min = drift_s / 60
         if drift_min > max_drift_minutes:
             continue
 
-        # Score: overlap dominates, drift is a small penalty
         score = (overlap_pct * 100) - (drift_min * 0.5)
         if score > best_score:
             best_score = score
@@ -307,12 +297,9 @@ def get_activity_exercise_sets(client: Garmin, activity_id: int) -> dict:
 
 
 def push_exercise_sets(client: Garmin, activity_id: int, payload: dict) -> None:
-    """PUT exercise sets to an existing Garmin activity.
-
-    Uses the undocumented /activity-service/activity/{id}/exerciseSets endpoint.
-    """
+    """PUT exercise sets to an existing Garmin activity."""
     url = f"/activity-service/activity/{activity_id}/exerciseSets"
-    time.sleep(1.0)  # manual rate limit
+    time.sleep(1.0)
     client.client.request("PUT", "connectapi", url, json=payload)
     logger.info("  Pushed %d exercise sets to activity %s", len(payload.get("exerciseSets", [])), activity_id)
 
@@ -328,7 +315,6 @@ def generate_description(workout: dict, calories: int | None = None, avg_hr: int
     if start and end:
         from datetime import datetime
         try:
-            fmt = "%Y-%m-%dT%H:%M:%S%z" if "T" in start else "%Y-%m-%d %H:%M:%S"
             t0 = datetime.fromisoformat(start.replace("Z", "+00:00"))
             t1 = datetime.fromisoformat(end.replace("Z", "+00:00"))
             duration_s = int((t1 - t0).total_seconds())
@@ -354,7 +340,6 @@ def generate_description(workout: dict, calories: int | None = None, avg_hr: int
             warmup = [s for s in all_sets if s.get("type") == "warmup"]
             if normal:
                 n_label = "set" if len(normal) == 1 else "sets"
-                # Check if this is a cardio exercise
                 has_distance = any(s.get("distance_meters") for s in normal)
                 has_duration = any(s.get("duration_seconds") for s in normal)
                 has_weight = any(s.get("weight_kg") or s.get("weight") for s in normal)
