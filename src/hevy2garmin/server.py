@@ -900,7 +900,6 @@ async def settings_save(
 
 # ── API (HTMX) ──────────────────────────────────────────────────────────────
 
-
 @app.post("/api/mapping", response_class=HTMLResponse)
 async def api_save_mapping(request: Request):
     """Save a custom exercise mapping."""
@@ -930,9 +929,20 @@ async def api_save_mapping(request: Request):
     global _unmapped_cache
     _unmapped_cache = None
 
+    # Also drop it from the persisted unmapped cache, so it stops showing as
+    # unmapped on every instance — not just whichever one cleared its memory.
+    if db.get_database_url():
+        try:
+            _db = db.get_db()
+            cached = _db.get_app_config("unmapped_exercises")
+            if isinstance(cached, dict) and hevy_name in cached:
+                del cached[hevy_name]
+                _db.set_app_config("unmapped_exercises", cached)
+        except Exception:
+            pass
+
     cat_label = _get_cat_names().get(category, f"Category {category}")
     return HTMLResponse(f'<div class="toast toast-success">Mapped "{hevy_name}" → {cat_label} ({category}:{subcategory}). <a href="/mappings">Reload</a></div>')
-
 
 @app.post("/api/mapping/delete", response_class=HTMLResponse)
 async def api_delete_mapping(request: Request):
