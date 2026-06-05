@@ -1528,7 +1528,7 @@ async def _do_sync_one(request: Request):
     unsynced = None
     unmapped_found: dict[str, int] = {}
     page = 1
-    max_pages = min(10, (remaining // 10) + 2)  # Don't search forever
+    max_pages = (remaining // 10) + 2  # Don't search forever
     while page <= max_pages:
         data = hevy.get_workouts(page=page, page_size=10)
         workouts = data.get("workouts", [])
