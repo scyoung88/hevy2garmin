@@ -94,12 +94,11 @@ def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None =
     # Only match by start time — never grab "most recent activity" because
     # that can pick up an unrelated run/ride and rename the wrong thing.
     if not activity_id and workout_start:
-        for attempt, wait in enumerate([3, 5, 10], 1):
-            time.sleep(wait)
-            activity_id = find_activity_by_start_time(client, workout_start)
-            if activity_id:
-                break
-            logger.info("  Activity not found yet (attempt %d/%d), retrying...", attempt, 3)
+        time.sleep(3)  # Small delay for Garmin to process the activity
+        activity_id = find_activity_by_start_time(client, workout_start)
+        
+        if not activity_id:
+            logger.warning("  Activity not found after single attempt")
 
     if activity_id:
         logger.info("  Found activity %s", activity_id)
