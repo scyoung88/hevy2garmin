@@ -73,6 +73,7 @@ def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None =
             raise RuntimeError(f"Garmin upload failed ({getattr(response, 'status_code', '?')}): {body}") from e
         logger.error("Upload failed (no response): %s", str(e)[:300])
         raise
+
     upload_id = None
     activity_id = None
 
@@ -90,15 +91,9 @@ def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None =
     else:
         logger.info("  Upload response: %s", str(resp)[:200])
 
-    # Find the activity ID for renaming (retry with backoff if needed).
-    # Only match by start time — never grab "most recent activity" because
-    # that can pick up an unrelated run/ride and rename the wrong thing.
+    # Find the activity ID for renaming (with detailed logging)
     if not activity_id and workout_start:
-        time.sleep(3)  # Small delay for Garmin to process the activity
         activity_id = find_activity_by_start_time(client, workout_start)
-        
-        if not activity_id:
-            logger.warning("  Activity not found after single attempt")
 
     if activity_id:
         logger.info("  Found activity %s", activity_id)
@@ -106,73 +101,6 @@ def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None =
         logger.warning("  Could not find activity ID after upload. Workout will appear as 'Strength Training' on Garmin.")
 
     return {"upload_id": upload_id, "activity_id": activity_id}
-
-
-def find_activity_by_start_time(
-    client: Garmin,
-    target_start: str,
-    window_minutes: int = 10,
-) -> int | None:
-    """Find a Garmin activity matching a start time within a window."""
-    from datetime import datetime, timedelta
-
-    try:
-        target = datetime.fromisoformat(target_start.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-
-    try:
-        activities = _limiter.call(client.get_activities, 0, 10)
-    except Exception:
-        return None
-
-    for act in activities:
-        # Only match strength training activities — skip runs, bikes, yoga, etc.
-        act_type = act.get("activityType", {}).get("typeKey", "")
-        if act_type and act_type not in ("strength_training", "other"):
-            continue
-
-        # Prefer startTimeGMT (UTC) over startTimeLocal to avoid timezone mismatch
-        act_start_str = act.get("startTimeGMT") or act.get("startTimeLocal", "")
-        try:
-            if "T" not in act_start_str:
-                act_start_str = act_start_str.replace(" ", "T")
-            act_start = datetime.fromisoformat(act_start_str)
-            # Both should be UTC now, compare naive
-            target_naive = target.replace(tzinfo=None) if target.tzinfo else target
-            act_naive = act_start.replace(tzinfo=None) if act_start.tzinfo else act_start
-            if abs((act_naive - target_naive).total_seconds()) < window_minutes * 60:
-                return act.get("activityId")
-        except (ValueError, TypeError):
-            continue
-    return None
-
-
-def rename_activity(client: Garmin, activity_id: int, name: str) -> None:
-    """Rename a Garmin activity."""
-    _limiter.call(client.set_activity_name, activity_id, name)
-    logger.info("  Renamed activity %s to '%s'", activity_id, name)
-
-
-def set_description(client: Garmin, activity_id: int, description: str) -> None:
-    """Set description for a Garmin activity."""
-    url = f"/activity-service/activity/{activity_id}"
-    payload = {"activityId": activity_id, "description": description}
-    client.client.request("PUT", "connectapi", url, json=payload)
-    time.sleep(1.0)
-    logger.info("  Description set (%d chars)", len(description))
-
-
-def upload_image(client: Garmin, activity_id: int, image_bytes: bytes, filename: str = "image.png") -> None:
-    """Upload an image to a Garmin activity."""
-    files = {"file": (filename, io.BytesIO(image_bytes))}
-    client.client.request(
-        "POST", "connectapi",
-        f"/activity-service/activity/{activity_id}/image",
-        files=files,
-    )
-    time.sleep(1.0)
-    logger.info("  Image uploaded (%dKB)", len(image_bytes) // 1024)
 
 
 def find_activity_by_start_time(
@@ -245,6 +173,133 @@ def find_activity_by_start_time(
     return None
 
 
+def rename_activity(client: Garmin, activity_id: int, name: str) -> None:
+    """Rename a Garmin activity."""
+    _limiter.call(client.set_activity_name, activity_id, name)
+    logger.info("  Renamed activity %s to '%s'", activity_id, name)
+
+
+def set_description(client: Garmin, activity_id: int, description: str) -> None:
+    """Set description for a Garmin activity."""
+    url = f"/activity-service/activity/{activity_id}"
+    payload = {"activityId": activity_id, "description": description}
+    client.client.request("PUT", "connectapi", url, json=payload)
+    time.sleep(1.0)
+    logger.info("  Description set (%d chars)", len(description))
+
+
+def upload_image(client: Garmin, activity_id: int, image_bytes: bytes, filename: str = "image.png") -> None:
+    """Upload an image to a Garmin activity."""
+    files = {"file": (filename, io.BytesIO(image_bytes))}
+    client.client.request(
+        "POST", "connectapi",
+        f"/activity-service/activity/{activity_id}/image",
+        files=files,
+    )
+    time.sleep(1.0)
+    logger.info("  Image uploaded (%dKB)", len(image_bytes) // 1024)
+
+
+def find_matching_garmin_activity(
+    client: Garmin,
+    hevy_workout: dict,
+    overlap_threshold: float = 0.70,
+    max_drift_minutes: int = 20,
+) -> dict | None:
+    """Find a user-recorded Garmin Strength Training activity matching a Hevy workout.
+
+    Searches for activities that overlap the Hevy workout's time window,
+    then scores by temporal overlap and start-time proximity.
+
+    Returns the best-matching activity dict, or None if nothing qualifies.
+    Only matches completed activities of type 'strength_training'.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    start_raw = hevy_workout.get("start_time") or hevy_workout.get("startTime", "")
+    end_raw = hevy_workout.get("end_time") or hevy_workout.get("endTime", "")
+    if not start_raw or not end_raw:
+        return None
+
+    try:
+        hevy_start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+        hevy_end = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+    hevy_duration = (hevy_end - hevy_start).total_seconds()
+    if hevy_duration <= 0:
+        return None
+
+    # Query activities in a window around the workout
+    search_start = (hevy_start - timedelta(hours=2)).date().isoformat()
+    search_end = (hevy_end + timedelta(hours=2)).date().isoformat()
+    try:
+        activities = _limiter.call(client.get_activities_by_date, search_start, search_end)
+    except Exception as e:
+        logger.warning("Could not query Garmin activities for merge: %s", e)
+        return None
+
+    best_score = 0.0
+    best: dict | None = None
+
+    for act in (activities or []):
+        # Hard filter: strength_training only
+        act_type = act.get("activityType", {}).get("typeKey", "")
+        if act_type != "strength_training":
+            continue
+
+        # Must be a completed activity (has duration)
+        act_duration = act.get("duration", 0)
+        if not act_duration or act_duration <= 0:
+            continue
+
+        # Parse start time
+        act_start_str = act.get("startTimeGMT") or act.get("startTimeLocal", "")
+        try:
+            if "T" not in act_start_str:
+                act_start_str = act_start_str.replace(" ", "T")
+            act_start = datetime.fromisoformat(act_start_str)
+            if act_start.tzinfo is None:
+                act_start = act_start.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+
+        act_end = act_start + timedelta(seconds=act_duration)
+
+        # Check: activity must be finished.
+        if act_end > datetime.now(timezone.utc) + timedelta(minutes=5):
+            continue
+
+        # Compute temporal overlap
+        overlap_start = max(hevy_start.replace(tzinfo=timezone.utc), act_start.replace(tzinfo=timezone.utc))
+        overlap_end = min(hevy_end.replace(tzinfo=timezone.utc), act_end.replace(tzinfo=timezone.utc))
+        overlap_s = max(0.0, (overlap_end - overlap_start).total_seconds())
+        overlap_pct = overlap_s / hevy_duration
+
+        if overlap_pct < overlap_threshold:
+            continue
+
+        # Check start drift
+        drift_s = abs((act_start.replace(tzinfo=timezone.utc) - hevy_start.replace(tzinfo=timezone.utc)).total_seconds())
+        drift_min = drift_s / 60
+        if drift_min > max_drift_minutes:
+            continue
+
+        # Score: overlap dominates, drift is a small penalty
+        score = (overlap_pct * 100) - (drift_min * 0.5)
+        if score > best_score:
+            best_score = score
+            best = act
+
+    if best:
+        logger.info(
+            "Merge match: Garmin activity %s (overlap %.0f%%, drift %.1fmin)",
+            best.get("activityId"), best_score, 0,
+        )
+    return best
+
+
 def get_activity_exercise_sets(client: Garmin, activity_id: int) -> dict:
     """GET exercise sets for a Garmin activity (for backup before merge)."""
     time.sleep(1.0)
@@ -255,10 +310,6 @@ def push_exercise_sets(client: Garmin, activity_id: int, payload: dict) -> None:
     """PUT exercise sets to an existing Garmin activity.
 
     Uses the undocumented /activity-service/activity/{id}/exerciseSets endpoint.
-    Atomically replaces ALL exercise sets on the activity.
-
-    Note: called directly (not through _limiter) because the endpoint returns
-    204 No Content which the rate limiter misinterprets as an error.
     """
     url = f"/activity-service/activity/{activity_id}/exerciseSets"
     time.sleep(1.0)  # manual rate limit
@@ -303,12 +354,11 @@ def generate_description(workout: dict, calories: int | None = None, avg_hr: int
             warmup = [s for s in all_sets if s.get("type") == "warmup"]
             if normal:
                 n_label = "set" if len(normal) == 1 else "sets"
-                # Check if this is a cardio exercise (has distance or duration, no weight/reps)
+                # Check if this is a cardio exercise
                 has_distance = any(s.get("distance_meters") for s in normal)
                 has_duration = any(s.get("duration_seconds") for s in normal)
                 has_weight = any(s.get("weight_kg") or s.get("weight") for s in normal)
                 if has_distance or (has_duration and not has_weight):
-                    # Cardio: show distance and/or duration
                     total_dist = sum(s.get("distance_meters", 0) or 0 for s in normal)
                     total_dur = sum(s.get("duration_seconds", 0) or 0 for s in normal)
                     parts = [f"{len(normal)} {n_label}"]
