@@ -1530,7 +1530,7 @@ async def _do_sync_one(request: Request):
     page = 1
     max_pages = (remaining // 10) + 2  # Don't search forever
     while page <= max_pages:
-        data = hevy.get_workouts(page=page, page_size=10)
+        max_pages = (total_count // 10) + 2  # cover the whole library so backfill reaches old unsynced workouts
         workouts = data.get("workouts", [])
         if not workouts:
             break
